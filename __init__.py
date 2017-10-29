@@ -145,6 +145,14 @@ class SshClient(object):
 		return True
 
 	def kill_process_by_pids(self, pids):
+		"""
+		Kills a list of processes on the remote machine based on pids. If a list is not passed in
+		it will be converted to one. It returns a list of pids that were killed successfully.
+		
+		:param int/string/list pids: PID(s) to kill on the remote machine
+		:return: List of PIDs successfully killed
+		:rtype: list
+		"""
 		if not isinstance(pids, list):
 			pids = [pids]
 
