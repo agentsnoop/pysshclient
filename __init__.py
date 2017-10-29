@@ -25,6 +25,7 @@ class SshClient(object):
 
 	@property
 	def connected(self):
+		"""Checks if there is an active SSH session"""
 		if self._client:
 			try:
 				transport = self._client.get_transport()
@@ -36,6 +37,7 @@ class SshClient(object):
 		return False
 
 	def connect(self):
+		"""Create an SSH session"""
 		self._client = paramiko.SSHClient()
 		self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 		if self._load_keys:
@@ -58,6 +60,7 @@ class SshClient(object):
 		return False
 
 	def disconnect(self):
+		"""Disconnect SSH session, if active"""
 		if self._client:
 			try:
 				self._client.close()
@@ -66,6 +69,18 @@ class SshClient(object):
 		self._client = None
 
 	def run(self, command, redirect="", background=False, max_wait=None, response_type=RES_PID):
+		"""
+		Run command on remote machine. Output redirection, whether to run in the background, 
+		how long to wait for output, and the response type can all be set.
+		
+		:param string command: Command to execute remotely
+		:param string redirect: Output redirect paramters, if desired.
+		:param boolean background: Whether or not to run the command in the background, and not wait for the result of the command.
+		:param float max_wait: Maximum time to wait for output from the command. None allows for an unlimited amount of time.
+		:param int response_type: Which data to output from the command. Logical or values together to get more data
+		:return: One or more values based on response type: (RES_PID, RES_CODE, RES_SUCCESS, RES_STDOUT, RES_STDERR)
+		:rtype: tuple
+		"""
 		stdout 			= None
 		stderr 			= None
 		pid				= -1
