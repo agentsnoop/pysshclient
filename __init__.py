@@ -125,6 +125,19 @@ class SshClient(object):
 		return out
 
 	def wait_for_remote_task(self, pid, process_name, max_time, sleep_time=60, msg=None):
+		"""
+		Waits until a process has finished processing on the remote machine, based on PID and process name.
+		It will sleep up until the max_time specified, sleeping every x seconds defined by sleep_time. A custom
+		message can be specified by msg.
+		
+		:param string/int pid: PID of process to monitor
+		:param string process_name: Name of process to match to PID, for extra verification
+		:param float max_time: Maximum amount of time to wait for process to finish
+		:param float sleep_time: Time to sleep inbetween checksum
+		:param string msg: Custom message to display while waiting
+		:return: Whether the process successfully completed in the alloted time or not
+		:rtype: boolean
+		"""
 		if msg is None:
 			msg = "Waiting for {pid} to complete"
 		msg = msg.format(pid=pid)
@@ -165,6 +178,14 @@ class SshClient(object):
 		return culled_pids
 
 	def kill_processes_by_command(self, command):
+		"""
+		Kills a list of processes on the remote machine based on command being run. 
+		It returns a list of pids that were killed successfully.
+		
+		:param string command: Command to search for on the remote machine
+		:return: List of PIDs successfully killed
+		:rtype: list
+		"""
 		culled_pids = []
 		(processes,) = self.run("""ps -elf | grep "{command}" | grep -v grep""".format(command=command), response_type=RES_STDOUT)
 		for process in processes:
@@ -178,12 +199,23 @@ class SshClient(object):
 
 	@staticmethod
 	def get_pid_from_ps(lines):
+		"""
+		Helper function to get pids from ps -elf command
+		
+		:param list lines: Lines to parse from ps -elf output
+		"""
 		for line in lines:
 			items = [item for item in line.split(" ") if item]
 			return items[3]
-		return None
 
 	def get_checksum(self, path):
+		"""
+		Helper function to get checksum of a file on a remote machine
+		
+		:param string path: Path of file on remote machine
+		:return: Checksum of the remote file
+		:rtype: string
+		"""
 		(o,) = self.run("md5sum {path}".format(path=path), response_type=RES_STDOUT)
 		checksum = "".join(o).replace(path, "").strip()
 		return checksum
