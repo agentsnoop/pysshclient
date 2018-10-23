@@ -1,15 +1,14 @@
 import time
 import os
+import socket
+import tempfile
 
 import paramiko
+from scp import SCPClient
 
-RES_PID 	= 1
-RES_CODE 	= 2
-RES_SUCCESS	= 4
-RES_STDOUT 	= 8
-RES_STDERR	= 16
+from response import Response
 
-CMD_PS_GREP	= "ps -p {pid} | grep {pid}"
+CMD_PS_GREP		= "ps -lfp {pid} | grep {pid}"
 
 class SshClient(object):
 
@@ -25,7 +24,6 @@ class SshClient(object):
 
 	@property
 	def connected(self):
-		"""Checks if there is an active SSH session"""
 		if self._client:
 			try:
 				transport = self._client.get_transport()
@@ -36,13 +34,24 @@ class SshClient(object):
 				pass
 		return False
 
-	def connect(self):
-		"""Create an SSH session"""
+	def connect(self, retry_count=5):
 		self._client = paramiko.SSHClient()
 		self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-		if self._load_keys:
+		if self._password is None:
 			self._client.load_system_host_keys()
 
+		if not self._client:
+			return False
+
+		attempt = 0
+		while attempt < retry_count:
+			if self._connect():
+				return True
+			attempt += 1
+			time.sleep(5.0)
+		return False
+
+	def _connect(self):
 		try:
 			self._client.connect(
 				self._host,
@@ -52,11 +61,21 @@ class SshClient(object):
 				timeout=self._timeout,
 				allow_agent=(self._password is None),
 				look_for_keys=(self._password is None))
-			if self._scp_client:
-				self._scp_client = SCPClient(self._client.get_transport())
+			# self._client.get_transport().set_keepalive(1)
+			# if self._scp_client:
+			# 	self._scp_client = SCPClient(self._client.get_transport())
 			return True
-		except Exception as e:
-			print("Unable to connect to {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e))
+		except paramiko.BadHostKeyException as e1:
+			print("Bad Host Key for {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e1))
+		except paramiko.AuthenticationException as e2:
+			print("Bad Authentication for {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e2))
+		except paramiko.SSHException as e3:
+			print("SSH Exception for {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e3))
+		except socket.error as e4:
+			print("Socket error for {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e4))
+		except Exception as e5:
+			print(type(e5))
+			print("Unable to connect to {host}:{port} as {user}: {error}".format(host=self._host, port=self._port, user=self._user, error=e5))
 		return False
 
 	def disconnect(self):
@@ -68,7 +87,11 @@ class SshClient(object):
 				pass
 		self._client = None
 
-	def run(self, command, redirect="", background=False, max_wait=None, response_type=RES_PID):
+	def run_and_wait(self, command, search, max_time=60, redirect=""):
+		(pid,) = self.run(command, redirect, background=True, max_wait=5)
+		return self.wait_for_remote_task(pid, search, max_time=max_time)
+
+	def run(self, command, redirect="", background=False, max_wait=None):
 		"""
 		Run command on remote machine. Output redirection, whether to run in the background, 
 		how long to wait for output, and the response type can all be set.
@@ -84,7 +107,7 @@ class SshClient(object):
 		stdout 			= None
 		stderr 			= None
 		pid				= -1
-		exit_code 		= -999
+		code 			= -999
 		pre_command		= "echo $$; exec"
 		post_command	= ""
 		if background:
@@ -102,6 +125,17 @@ class SshClient(object):
 
 		if self.connected or self.connect():
 			try:
+				tmp_file = None
+				if "&&" in command or "||" in command or ";" in command:
+					tmp_file = tempfile.NamedTemporaryFile(delete=False)
+					tmp_file.write("#!/bin/sh\n\n")
+					tmp_file.write(command)
+					tmp_file.close()
+					self.put_file(tmp_file.name, "/tmp")
+					os.unlink(tmp_file.name)
+					# self._client.exec_command("echo '#!/bin/sh\n\n{command}' > /tmp/cmd.sh; chmod +x /tmp/cmd.sh".format(command=command))
+					command = "sh /tmp/{filename}".format(filename=os.path.basename(tmp_file.name))
+
 				cmd = "{pre} {command} {redirect} {post}".format(pre=pre_command, command=command, redirect=redirect, post=post_command)
 				start_time = time.time()
 				stdin_obj, stdout_obj, stderr_obj = self._client.exec_command(cmd)
@@ -115,29 +149,123 @@ class SshClient(object):
 							stderr_obj.channel.close()
 						break
 
-				exit_code 	= stdout_obj.channel.recv_exit_status()
-				stderr 		= stderr_obj.readlines()
-				stdout 		= stdout_obj.readlines()
+				code 	= stdout_obj.channel.recv_exit_status()
+				stderr 	= stderr_obj.readlines()
+				stdout 	= stdout_obj.readlines()
 				if stdout:
 					pid 	= stdout[0].strip()
 					stdout 	= [l.strip() for l in stdout[1:]]
 				if stderr:
 					stderr	= [l.strip() for l in stderr]
+
+				if tmp_file:
+					self._client.exec_command("rm -f /tmp/{filename}".format(filename=os.path.basename(tmp_file.name)))
 			except Exception as e:
 				print("Encountered a problem while performing SSH ({command}): {error}".format(command=command, error=str(e)))
 
-		out = tuple()
-		if response_type & RES_PID:
-			out += (pid,)
-		if response_type & RES_CODE:
-			out += (exit_code,)
-		if response_type & RES_SUCCESS:
-			out += (exit_code == 0,)
-		if response_type & RES_STDOUT:
-			out += (stdout,)
-		if response_type & RES_STDERR:
-			out += (stderr,)
-		return out
+		return Response(obj=None, pid=pid, code=code, stdout=stdout, stderr=stderr)
+
+	# def get_file(self, src, dst, verify=False):
+	# 	return scp_io.get_file(src, dst, self._host, self._port, self._user, self._password)
+
+	# def put_file(self, src, dst, owner=None, group=None, verify=False):
+	# 	return scp_io.put_file(src, dst, self._host, self._port, self._user, self._password, owner=owner, group=group)
+
+	def get_file(self, src, dst, recursive=False, preserve_times=False, verify=False):
+		try:
+			if not self._scp_client:
+				self._scp_client = SCPClient(self._client.get_transport())
+			self._scp_client.get(remote_path=src, local_path=dst, recursive=recursive, preserve_times=preserve_times)
+			return True
+		except Exception as e:
+			print("Encountered a problem while doing SCP: {error}".format(error=str(e)))
+			self._scp_client = None
+		return False
+
+	def put_file(self, src, dst="", permissions=None, owner=None, group=None, max_sessions=999, preserve_times=False, verify=False):
+		if not self._create_parent(dst, max_sessions):
+			return False
+
+		try:
+			if not self._scp_client:
+				self._scp_client = SCPClient(self._client.get_transport())
+			self._scp_client.put(src, remote_path=dst, recursive=os.path.isdir(src), preserve_times=preserve_times)
+		except Exception as e:
+			print("Encountered a problem performing SCP: {error}".format(error=str(e)))
+			self._scp_client = None
+			return False
+
+		self._set_permission(owner, group, permissions, dst, max_sessions)
+		return True
+
+	def get_file2(self, src, dst, checksum=None, max_attempts=None):
+		try:
+			if not self._scp_client:
+				self._scp_client = SCPClient(self._client.get_transport())
+		except Exception as e:
+			try:
+				self._scp_client = SCPClient(self._client.get_transport())
+			except Exception as e:
+				print("Encountered a problem while doing SCP: {error}".format(error=str(e)))
+				return False
+
+		file_io.makedirs(os.path.dirname(dst))
+		if not checksum:
+			checksum = self.get_checksum(src)
+
+		success = os.path.exists(dst) and file_io.get_md5(dst) == checksum
+		if success:
+			print("{dst} already present...skipping".format(dst=dst))
+			return True
+
+		print("Getting {src} --> {dst}".format(src=src, dst=dst))
+		attempts = 0
+		while not success:
+			attempts += 1
+			if max_attempts and attempts > max_attempts:
+				return False
+
+			self._scp_client.get(remote_path=src, local_path=dst)
+			success = file_io.get_md5(dst) == checksum
+			time.sleep(1)
+		return True
+
+	def put_file2(self, src, dst="", checksum=None, max_attempts=None, owner=None, group=None, permissions=None, max_sessions=999):
+		try:
+			if not self._scp_client:
+				self._scp_client = SCPClient(self._client.get_transport())
+		except Exception as e:
+			try:
+				self._scp_client = SCPClient(self._client.get_transport())
+			except Exception as e:
+				print("Encountered a problem while doing SCP: {error}".format(error=str(e)))
+				return False
+
+		if not self._create_parent(dst, max_sessions):
+			return False
+		self.run("chown -R {owner}:{group} {path}".format(owner=owner, group=group, path=dst))
+
+		if not checksum:
+			checksum = file_io.get_md5(src)
+
+		success = self.get_checksum(dst) == checksum
+		if success:
+			print("{dst} already present...skipping".format(dst=dst))
+			return True
+
+		print("Putting {src} --> {dst}".format(src=src, dst=dst))
+		attempts = 0
+		while not success:
+			attempts += 1
+			if max_attempts and attempts > max_attempts:
+				return False
+
+			self._client.put_file(src, remote_path=dst, recursive=os.path.isdir(src))
+			success = self.get_checksum(dst) == checksum
+			time.sleep(1)
+
+		self._set_permission(owner, group, permissions, dst, max_sessions)
+		return True
 
 	def wait_for_remote_task(self, pid, process_name, max_time, sleep_time=60, msg=None):
 		"""
@@ -158,19 +286,22 @@ class SshClient(object):
 		msg = msg.format(pid=pid)
 
 		start_time = time.time()
-		(stdout,) = self.run(CMD_PS_GREP.format(pid=pid), response_type=RES_STDOUT)
-		output = "\n".join(stdout)
-		while process_name in output:
-			if time.time()-start_time > max_time:
-				print("Time has elapsed, exiting")
+		running = self.check_remote_process(pid, process_name)
+		while running:
+			if max_time and time.time()-start_time > max_time:
+				print("Time has elapsed waiting for process, exiting")
 				return False
 
-			print("{msg}... Found [{pid}]".format(msg=msg, pid=output.split()[0]))
-			(stdout,) = self.run(CMD_PS_GREP.format(pid=pid), response_type=RES_STDOUT)
-			if isinstance(stdout, list):
-				output = "\n".join(stdout)
+			print("{msg}... Found [{pid}]".format(msg=msg, pid=pid))
+			running = self.check_remote_process(pid, process_name)
 			time.sleep(sleep_time)
 		return True
+
+	def check_remote_process(self, pid, process_name):
+		stdout = self.run(CMD_PS_GREP.format(pid=pid)).stdout
+		if isinstance(stdout, list):
+			output = "\n".join(stdout)
+		return process_name in output
 
 	def kill_process_by_pids(self, pids):
 		"""
@@ -187,8 +318,7 @@ class SshClient(object):
 		culled_pids = []
 		for pid in pids:
 			print("Killing {pid} on remote machine".format(pid=pid))
-			(success,) = self.run("kill -9 {pid}".format(pid=pid), response_type=RES_SUCCESS)
-			if success:
+			if self.run("kill -9 {pid}".format(pid=pid)).success:
 				culled_pids.append(pid)
 		return culled_pids
 
@@ -202,13 +332,12 @@ class SshClient(object):
 		:rtype: list
 		"""
 		culled_pids = []
-		(processes,) = self.run("""ps -elf | grep "{command}" | grep -v grep""".format(command=command), response_type=RES_STDOUT)
+		processes = self.run("""ps -elf | grep "{command}" | grep -v grep""".format(command=command)).stdout
 		for process in processes:
 			items = [item for item in process.split(" ") if item]
 			pid = items[3]
 			print("Killing {pid} on remote machine".format(pid=pid))
-			(success,) = self.run("kill -9 {pid}".format(pid=pid), response_type=RES_SUCCESS)
-			if success:
+			if self.run("kill -9 {pid}".format(pid=pid)).success:
 				culled_pids.append(pid)
 		return culled_pids
 
@@ -222,6 +351,7 @@ class SshClient(object):
 		for line in lines:
 			items = [item for item in line.split(" ") if item]
 			return items[3]
+		return None
 
 	def get_checksum(self, path):
 		"""
@@ -231,6 +361,40 @@ class SshClient(object):
 		:return: Checksum of the remote file
 		:rtype: string
 		"""
-		(o,) = self.run("md5sum {path}".format(path=path), response_type=RES_STDOUT)
+		o = self.run("md5sum {path}".format(path=path)).stdout
 		checksum = "".join(o).replace(path, "").strip()
 		return checksum
+
+	def _create_parent(self, dst, max_sessions=999):
+		parent = os.path.dirname(dst)
+		if max_sessions == 1:
+			with ssh(self._host, self._port, self._user, self._password) as conn:
+				try:
+					# i, o, e = conn.exec_command("mkdir -p {parent} && [ -d {parent} ]".format(parent=parent))
+					i, o, e = conn.exec_command("mkdir -p {parent}".format(parent=parent))
+					code = o.channel.recv_exit_status()
+					if code == 0:
+						return True
+					print("Did not create parents: Exit code {code}".format(code=code))
+				except Exception as e:
+					print("Encountered a problem creating parents: {error}".format(error=str(e)))
+			return False
+		# return self.run("mkdir -p {parent} && [ -d {parent} ]".format(parent=parent, response_type=RES_SUCCESS))
+		return self.run("mkdir -p {parent}".format(parent=parent, response_type=RES_SUCCESS))
+
+	def _set_permission(self, owner, group, permissions, dst, max_sessions):
+		if max_sessions == 1:
+			with ssh(self._host, self._port, self._user, self._password) as conn:
+				if owner and group:
+					conn.exec_command("chown {owner}:{group} {path}".format(owner=owner, group=group, path=dst))
+
+				if permissions:
+					conn.exec_command("chmod {permissions} {path}".format(permissions=permissions, path=dst))
+			return True
+
+		if owner and group:
+			self.run("chown {owner}:{group} {path}".format(owner=owner, group=group, path=dst))
+
+		if permissions:
+			self.run("chmod {permissions} {path}".format(permissions=permissions, path=dst))
+		return True
